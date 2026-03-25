@@ -187,6 +187,48 @@ $DOCKER run -d \
 
 > **`--workers 4`**: Multi-worker uvicorn prevents a single slow Neo4j write from blocking all other requests. Especially important for NAS deployments where single-worker is the default.
 
+## Multi-Machine Deployment (多台 Mac Mini 共用)
+
+### User ID 策略
+
+MemOS 用 `user_id` 做數據隔離（搜索時按 `cube_id` 過濾）。
+
+| 場景 | 建議 | 原因 |
+|------|------|------|
+| 同一個人的多台機器 | **共用同一個 `user_id`**（如 `scott`） | 記憶互通，任何一台存的記憶其他台都能搜到 |
+| 不同人共用 NAS MemOS | **各用各的 `user_id`** | 數據隔離，互不干擾 |
+| 壓測/測試 | **用獨立 `user_id`**（如 `stress-test`） | 避免測試數據污染正式記憶 |
+
+### OpenClaw 配置（每台機器的 openclaw.json）
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memos": {
+        "config": {
+          "baseUrl": "http://10.10.10.66:8765",
+          "userId": "scott"
+        }
+      }
+    }
+  }
+}
+```
+
+**⚠️ 關鍵規則：**
+- 四台 Mac Mini 都指向同一個 NAS MemOS（`http://10.10.10.66:8765`）
+- 都用同一個 `userId: "scott"`（同一人的記憶應互通）
+- **不要**在壓測時用正式 `userId`，用 `stress-test` 或其他測試 ID
+- 壓測後記得清理測試數據（`--cleanup` 參數）
+
+### 避免並發衝突
+
+多台機器同時寫入同一個 NAS MemOS 時，Neo4j 可能出現鎖競爭：
+- **日常使用**（稀疏寫入）：完全沒問題
+- **批量導入/壓測**：同一時間只能一台在跑，否則 timeout 雪崩
+- **壓測前**：先清理舊測試數據，減少 Neo4j 節點數
+
 ## Known issues (2026-03-24)
 
 ### neo4j write bottleneck under sustained load
