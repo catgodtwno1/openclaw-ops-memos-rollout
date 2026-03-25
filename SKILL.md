@@ -93,6 +93,96 @@ bash scripts/install_memos_launchagent.sh
 | Embedding fails | SiliconFlow token invalid | Check `.env` `EMBEDDING_API_KEY` |
 | Add timeout after ~130 writes | Neo4j O(N) scan, missing indexes | Apply Neo4j indexes (see Known Issues) |
 | P99 latency >10s on add | Neo4j transaction backlog | Restart memos-api, apply indexes |
+| Add takes 7-15s (NAS) | ASYNC_MODE=sync → fine mode → LLM call | Patch core.py to force fast mode (see NAS Deployment) |
+| Container DNS resolution fails | Default bridge network | Use custom Docker network `oc-memory` |
+| Patches lost on restart | Container filesystem is ephemeral | Bind mount patched files + docker commit |
+
+## NAS Deployment (QNAP/Synology)
+
+### Docker network for container DNS
+
+Default Docker bridge network does **NOT** support container-name DNS resolution. Containers using hostnames like `oc-neo4j` or `oc-qdrant` will fail with `Name or service not known`.
+
+**Fix:** Create a custom Docker network and attach all related containers:
+
+```bash
+DOCKER=/path/to/docker  # QNAP: /share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker
+
+$DOCKER network create oc-memory
+$DOCKER network connect oc-memory oc-neo4j
+$DOCKER network connect oc-memory oc-qdrant
+
+# When creating memos-api, use --network oc-memory
+$DOCKER run -d --name oc-memos-api --network oc-memory ...
+```
+
+### ASYNC_MODE=sync causes LLM bottleneck (fixed 2026-03-25)
+
+**Symptom:** `/product/add` takes 7-15 seconds per request on NAS, even with very few nodes.
+
+**Root cause:** `ASYNC_MODE=sync` → `core.py` selects `mode="fine"` → every add calls `mem_reader.get_memory(mode="fine")` → invokes MiniMax LLM for structured memory extraction per chat window. The LLM round-trip (~10-15s) is the bottleneck, NOT Neo4j.
+
+**Fix:** Patch `core.py` to force fast mode (skips LLM, does text split + embedding only):
+
+```python
+# In /app/src/memos/mem_os/core.py, line ~763
+# Change: mode="fast" if sync_mode == "async" else "fine"
+# To:     mode="fast"
+```
+
+**Result:** 7,000-15,000ms → 320-725ms (~20x speedup)
+
+### Persisting patches across container restarts
+
+Patches inside Docker containers are lost on restart. Two strategies:
+
+**Strategy 1: Bind mount patched files**
+```bash
+# Copy patched file out of container
+$DOCKER cp oc-memos-api:/app/src/memos/mem_os/core.py /path/to/core_patched.py
+
+# Add bind mount on container create
+-v /path/to/core_patched.py:/app/src/memos/mem_os/core.py
+```
+
+**Strategy 2: Docker commit (backup)**
+```bash
+$DOCKER commit -m "Patches: fast mode + neo4j indexes" oc-memos-api local/memos-api:patched-YYYYMMDD
+$DOCKER tag local/memos-api:patched-YYYYMMDD local/memos-api:latest
+```
+
+**Recommended:** Use both — bind mount for persistence, committed image as backup.
+
+### Complete NAS container creation example
+
+```bash
+DOCKER=/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker
+
+$DOCKER run -d \
+  --name oc-memos-api \
+  --restart unless-stopped \
+  --network oc-memory \
+  -p 8765:8000 \
+  -e ASYNC_MODE=sync \
+  -e NEO4J_BACKEND=neo4j-community \
+  -e NEO4J_URI=bolt://oc-neo4j:7687 \
+  -e NEO4J_USER=neo4j \
+  -e NEO4J_PASSWORD=YOUR_PASSWORD \
+  -e QDRANT_HOST=oc-qdrant \
+  -e QDRANT_PORT=6333 \
+  -e MOS_EMBEDDER_BACKEND=universal_api \
+  -e MOS_EMBEDDER_PROVIDER=openai \
+  -e MOS_EMBEDDER_MODEL=BAAI/bge-m3 \
+  -e MOS_EMBEDDER_API_BASE=https://api.siliconflow.cn/v1 \
+  -e MOS_EMBEDDER_API_KEY=YOUR_KEY \
+  -e EMBEDDING_DIMENSION=1024 \
+  -e PYTHONPATH=/app/src \
+  -e TZ=Asia/Shanghai \
+  -v /path/to/memos-data:/app/data \
+  -v /path/to/neo4j_community_patched.py:/app/src/memos/graph_dbs/neo4j_community.py \
+  -v /path/to/core_patched.py:/app/src/memos/mem_os/core.py \
+  local/memos-api:latest
+```
 
 ## Known issues (2026-03-24)
 
